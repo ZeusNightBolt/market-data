@@ -1,0 +1,31 @@
+# Large/local warehouse state
+*.duckdb
+*.duckdb.tmp/
+*.db
+*.sqlite
+*.sqlite3
+
+# Runtime/staging artifacts
+raw/
+logs/
+outputs/
+charts/
+*.log
+pull.log
+pull_*.log
+
+# Python/test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Env/secrets
+.env
+*.key
+*.pem
+
+# OS/editor
+.DS_Store
+*.swp
