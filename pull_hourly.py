@@ -35,7 +35,7 @@ MAX_WORKERS = 6             # v5: 6 workers for 1yr chunks (was 2 for 5yr)
 API_TIMEOUT = 20            # 1yr scans take 2-5s; 20s is generous
 TICKER_TIMEOUT = 120        # per-future timeout (covers 5 chunks × 20s)
 RETRIES = 0                 # these never 429 — just slow. don't retry.
-RECENT_GAP_DAYS = 3         # flag tickers where daily > hourly + this many days
+RECENT_GAP_HOURS = 1        # flag tickers where latest daily close is newer than latest hourly by >1h
 
 # Module-level: maps ticker → "YYYY-MM-DD" start date for recent-gap pull
 # Populated by get_incomplete_tickers(), consumed by generate_chunks()
@@ -132,8 +132,10 @@ def get_incomplete_tickers() -> list[str]:
                 incomplete.add(t)
 
         # ── Recent gap detection ──
-        # Tickers where daily data is significantly ahead of hourly data
-        # in the recent period (e.g., daily has May 29 but hourly stops at May 20).
+        # Tickers where daily data is ahead of hourly data in the recent period.
+        # This must be sub-day, not multi-day: Polygon can have the official daily
+        # close while hourly bars for that ticker still stop in the morning.  CELH
+        # showed this on 2026-06-16: daily close $30.01 but hourly stopped at 09:00.
         # The per-year check above excludes the current year; this catches that gap.
         RECENT_GAP_TICKERS.clear()
         try:
@@ -151,7 +153,7 @@ def get_incomplete_tickers() -> list[str]:
                 )
                 SELECT ticker, max_daily, max_hourly
                 FROM latest
-                WHERE max_daily > max_hourly + ({RECENT_GAP_DAYS} * 86400000)
+                WHERE max_daily > max_hourly + ({RECENT_GAP_HOURS} * 3600000)
                   AND max_hourly > 0  -- ticker has SOME hourly data
                 ORDER BY ticker
             """).fetchall()
@@ -165,7 +167,7 @@ def get_incomplete_tickers() -> list[str]:
                     RECENT_GAP_TICKERS[ticker] = start_date
                     incomplete.add(ticker)
             if recent_rows:
-                log.info(f"Recent gap tickers (daily > hourly + {RECENT_GAP_DAYS}d): {len(recent_rows):,}")
+                log.info(f"Recent gap tickers (daily > hourly + {RECENT_GAP_HOURS}h): {len(recent_rows):,}")
         except Exception as e:
             log.warning(f"Recent gap detection failed ({e}) — skipping")
 
