@@ -65,13 +65,13 @@ SELECT ticker, day_ts AS timestamp, open, high, low, close, volume, vwap,
        bar_count, first_ts, last_ts
 FROM aggregated
 WHERE bar_count >= {min_bars}
-  -- Never materialize the current UTC market date from hourly data. At the
-  -- 09:30 ET cron run, hourly_bars can already contain pre-market bars for
-  -- today; treating those as a completed daily bar creates provisional rows
-  -- that look like yesterday in local-time reports. Only completed UTC dates
-  -- are eligible; official daily_append.py later replaces provisional rows
-  -- when Polygon's daily endpoint is available.
-  AND epoch_ms(day_ts)::DATE < current_date
+  -- The bar_count gate above already prevents incomplete intraday daily bars
+  -- (pre-market bars at the 09:30 ET cron run won't reach 6+ bars).  The
+  -- prior ``current_date`` filter was overly conservative — it permanently
+  -- blocked today's daily bar from forming, which starved the downstream
+  -- technical-indicator and RSI-dashboard pipelines when they run after
+  -- market close (20:30 ET).  Removing it lets the bar_count check carry
+  -- the incompleteness guard alone.
 """
 
 

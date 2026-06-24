@@ -168,6 +168,46 @@ def get_incomplete_tickers() -> list[str]:
                     incomplete.add(ticker)
             if recent_rows:
                 log.info(f"Recent gap tickers (daily > hourly + {RECENT_GAP_HOURS}h): {len(recent_rows):,}")
+
+            # ── Stale hourly detection ──
+            # Catch tickers whose hourly data is >24h old regardless of daily
+            # state.  The daily>hourly check above only catches tickers where
+            # Polygon's daily endpoint is ahead of our hourly pull; it misses
+            # the case where both are stale because the cron was paused or a
+            # pull day was skipped (e.g. June 19-20 gap when cron was off).
+            STALE_HOURS = 24
+            db4 = duckdb.connect(str(DB_PATH))
+            stale_rows = db4.execute(f"""
+                WITH latest AS (
+                    SELECT ticker,
+                           COALESCE(
+                               (SELECT MAX(d.timestamp) FROM daily_bars d
+                                WHERE d.ticker = h.ticker), 0
+                           ) AS max_daily,
+                           COALESCE(
+                               (SELECT MAX(i.timestamp) FROM hourly_bars i
+                                WHERE i.ticker = h.ticker), 0
+                           ) AS max_hourly
+                    FROM hourly_bars h
+                    GROUP BY ticker
+                )
+                SELECT ticker, max_daily, max_hourly
+                FROM latest
+                WHERE max_hourly < (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
+                                   - ({STALE_HOURS} * 3600000)::BIGINT
+                  AND max_hourly > 0
+                ORDER BY ticker
+            """).fetchall()
+            db4.close()
+            for ticker, max_daily, max_hourly in stale_rows:
+                if ticker in all_vti and ticker not in incomplete:
+                    from datetime import datetime, timezone
+                    start_ts = datetime.fromtimestamp(max_hourly / 1000, tz=timezone.utc)
+                    start_date = start_ts.strftime("%Y-%m-%d")
+                    RECENT_GAP_TICKERS[ticker] = start_date
+                    incomplete.add(ticker)
+            if stale_rows:
+                log.info(f"Stale hourly tickers (>24h): {len(stale_rows):,}")
         except Exception as e:
             log.warning(f"Recent gap detection failed ({e}) — skipping")
 
