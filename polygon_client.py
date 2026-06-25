@@ -635,6 +635,54 @@ class PolygonClient:
         """Fetch snapshots for multiple tickers in parallel."""
         return self._bulk_fetch(self.snapshot, tickers)
 
+    @staticmethod
+    def _price_from_snapshot_payload(ticker: str, resp: dict) -> dict:
+        """Extract the freshest available price from Polygon's snapshot shape.
+
+        Snapshot responses are intentionally non-standard: single-ticker calls
+        return {"ticker": {...}} rather than {"results": [...]}. Prefer the
+        latest trade when present, then minute close, current day close, and
+        previous day close as a last-resort market-closed fallback.
+        """
+        symbol = ticker.upper()
+        if not isinstance(resp, dict) or resp.get("status") == "ERROR":
+            return {"status": "ERROR", "ticker": symbol, "price": None, "source": None, "timestamp": None, "raw_status": resp.get("status") if isinstance(resp, dict) else None, "error": resp.get("error") if isinstance(resp, dict) else "invalid response"}
+        snap = resp.get("ticker") or {}
+        if not isinstance(snap, dict):
+            return {"status": "ERROR", "ticker": symbol, "price": None, "source": None, "timestamp": None, "raw_status": resp.get("status"), "error": "missing ticker snapshot"}
+        candidates = [
+            ("snapshot.lastTrade.p", snap.get("lastTrade", {}).get("p"), snap.get("lastTrade", {}).get("t") or snap.get("updated")),
+            ("snapshot.min.c", snap.get("min", {}).get("c"), snap.get("min", {}).get("t") or snap.get("updated")),
+            ("snapshot.day.c", snap.get("day", {}).get("c"), snap.get("day", {}).get("t") or snap.get("updated")),
+            ("snapshot.prevDay.c", snap.get("prevDay", {}).get("c"), snap.get("prevDay", {}).get("t") or snap.get("updated")),
+        ]
+        for source, value, ts in candidates:
+            try:
+                if value is not None and float(value) > 0:
+                    return {"status": "OK", "ticker": symbol, "price": float(value), "source": source, "timestamp": ts, "raw_status": resp.get("status")}
+            except (TypeError, ValueError):
+                continue
+        return {"status": "ERROR", "ticker": symbol, "price": None, "source": None, "timestamp": snap.get("updated"), "raw_status": resp.get("status"), "error": "no usable price in snapshot"}
+
+    def latest_price(self, ticker: str) -> dict:
+        """Return the freshest available Polygon snapshot price for one ticker."""
+        symbol = ticker.upper()
+        return self._price_from_snapshot_payload(symbol, self.snapshot(symbol))
+
+    def latest_prices(self, tickers: list[str]) -> dict[str, dict]:
+        """Return freshest available Polygon snapshot prices for each ticker.
+
+        This is deliberately snapshot-based and side-effect free: no DuckDB
+        writes, no staged files, and safe to call from the Equity Screener after
+        deterministic candidate selection.
+        """
+        symbols = list(dict.fromkeys(t.upper() for t in tickers if t))
+        if not symbols:
+            return {}
+        if not hasattr(self, "max_workers"):
+            return {ticker: self.latest_price(ticker) for ticker in symbols}
+        return self._bulk_fetch(self.latest_price, symbols, per_ticker_timeout=max(30.0, len(symbols) * 10.0))
+
     # ═══════════════════════════════════════════════════════════════════
     # TECHNICALS
     # ═══════════════════════════════════════════════════════════════════
