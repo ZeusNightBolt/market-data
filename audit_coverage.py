@@ -113,10 +113,10 @@ def print_integrity_checks(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     """Print non-coverage invariants that catch silent warehouse drift.
 
     These are deliberately read-only checks: duplicate logical keys, duplicate
-    UTC market dates in daily bars, and provisional current-day daily bars. The
-    last check matters because the hourly-derived fallback can see pre-market
-    bars before a session is complete; those rows must not masquerade as a
-    completed daily bar.
+    UTC market dates in daily bars, current-day provisional daily bars, and
+    future provisional daily bars. Current-day hourly-derived rows are allowed
+    during market hours because downstream dashboards intentionally use them;
+    future provisional rows remain a strict failure.
     """
     print("\nIntegrity checks:")
     metrics: dict[str, int] = {}
@@ -129,14 +129,21 @@ def print_integrity_checks(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
                 HAVING c > 1
             )
         """).fetchone()[0]
-        metrics["daily_current_or_future_provisional_rows"] = con.execute("""
+        metrics["daily_current_provisional_rows"] = con.execute("""
             SELECT COUNT(*)
             FROM daily_bars
             WHERE transactions IS NULL
-              AND epoch_ms(timestamp::BIGINT)::DATE >= current_date
+              AND epoch_ms(timestamp::BIGINT)::DATE = current_date
+        """).fetchone()[0]
+        metrics["daily_future_provisional_rows"] = con.execute("""
+            SELECT COUNT(*)
+            FROM daily_bars
+            WHERE transactions IS NULL
+              AND epoch_ms(timestamp::BIGINT)::DATE > current_date
         """).fetchone()[0]
         print(f"  daily duplicate UTC market-date groups: {metrics['daily_duplicate_utc_dates']:,}")
-        print(f"  daily current/future provisional rows:  {metrics['daily_current_or_future_provisional_rows']:,}")
+        print(f"  daily current-day provisional rows:  {metrics['daily_current_provisional_rows']:,}")
+        print(f"  daily future provisional rows:       {metrics['daily_future_provisional_rows']:,}")
     for table, key_expr in [
         ("hourly_bars", "ticker, timestamp"),
         ("weekly_bars", "ticker, timestamp"),
@@ -251,10 +258,10 @@ def strict_issues(
 
     if integrity.get("daily_duplicate_utc_dates", 0) > 0:
         issues.append(f"daily_bars has {integrity['daily_duplicate_utc_dates']:,} duplicate ticker+UTC-date groups")
-    if integrity.get("daily_current_or_future_provisional_rows", 0) > 0:
+    if integrity.get("daily_future_provisional_rows", 0) > 0:
         issues.append(
-            f"daily_bars has {integrity['daily_current_or_future_provisional_rows']:,} "
-            "current/future provisional hourly-derived rows"
+            f"daily_bars has {integrity['daily_future_provisional_rows']:,} "
+            "future provisional hourly-derived rows"
         )
     for metric, value in integrity.items():
         if metric.endswith("_duplicate_keys") and value > 0:
