@@ -14,11 +14,12 @@ Usage:
   python3 create_indicator_views.py --drop   # remove all views
 """
 
+import os
 import sys
 from pathlib import Path
 import duckdb
 
-DB_PATH = Path.home() / "market-data" / "market_data.duckdb"
+DB_PATH = Path(os.environ.get("DB", Path.home() / "market-data" / "market_data.duckdb"))
 
 VIEWS_SQL = """
 -- ═══════════════════════════════════════════════════════════════════════
@@ -266,44 +267,48 @@ def drop_views():
 
 
 def verify():
+    """Lightweight view smoke test.
+
+    The old verification fully counted every derived view and grouped the 4h
+    view across ~34M hourly rows. On this host that can OOM/SIGKILL an otherwise
+    successful quick refresh. Keep verification fail-closed, but make it a
+    bounded smoke test: confirm each view can return a recent AAPL row or at
+    least one row without materializing the whole view.
+    """
     db = duckdb.connect(str(DB_PATH))
-    
-    # View groups with different verification queries
+
     indicator_views = ["v_indicators_daily", "v_indicators_1h", "v_indicators_4h"]
     summary_views = ["v_pivots_daily", "v_bollinger_daily", "v_vwap_bands"]
-    
-    for view in indicator_views + summary_views:
-        count = db.execute(f"SELECT COUNT(*) FROM {view}").fetchone()[0]
-        tickers = db.execute(f"SELECT COUNT(DISTINCT ticker) FROM {view}").fetchone()[0]
-        print(f"\n── {view} ──")
-        print(f"  {count:,} rows  |  {tickers:,} tickers")
-        
-        if view in indicator_views:
+
+    try:
+        for view in indicator_views:
             latest = db.execute(f"""
-                SELECT ticker, close, sma_20, sma_50, sma_200 
-                FROM {view} WHERE ticker = 'AAPL' 
-                ORDER BY timestamp DESC LIMIT 1
+                SELECT ticker, close, sma_20, sma_50, sma_200
+                FROM {view}
+                WHERE ticker = 'AAPL'
+                ORDER BY timestamp DESC
+                LIMIT 1
             """).fetchone()
-            if latest:
-                tkr, c, s20, s50, s200 = latest
-                print(f"  AAPL latest: C=${c:.2f}  SMA20=${s20:.2f}  SMA50=${s50:.2f}  SMA200=${s200:.2f}")
-    
-    # Also test volume spike detection
-    spikes = db.execute("""
-        SELECT COUNT(*) FROM v_indicators_daily 
-        WHERE ticker = 'AAPL' AND volume_spike = TRUE
-    """).fetchone()[0]
-    print(f"\n  AAPL volume spikes (view): {spikes}")
-    
-    # Test 4h count is reasonable
-    bars_per_tkr = db.execute("""
-        SELECT AVG(cnt) FROM (
-            SELECT ticker, COUNT(*) as cnt FROM v_indicators_4h GROUP BY ticker
-        )
-    """).fetchone()[0]
-    print(f"  4h avg bars per ticker: {bars_per_tkr:.0f}")
-    
-    db.close()
+            print(f"\n── {view} ──")
+            if not latest:
+                raise RuntimeError(f"{view} returned no AAPL smoke-test row")
+            tkr, c, s20, s50, s200 = latest
+            print(f"  {tkr} latest: C=${c:.2f}  SMA20=${s20:.2f}  SMA50=${s50:.2f}  SMA200=${s200:.2f}")
+
+        for view in summary_views:
+            row = db.execute(f"SELECT ticker, timestamp FROM {view} LIMIT 1").fetchone()
+            print(f"\n── {view} ──")
+            if not row:
+                raise RuntimeError(f"{view} returned no smoke-test row")
+            print(f"  smoke row: ticker={row[0]} timestamp={row[1]}")
+
+        spikes = db.execute("""
+            SELECT COUNT(*) FROM v_indicators_daily
+            WHERE ticker = 'AAPL' AND volume_spike = TRUE
+        """).fetchone()[0]
+        print(f"\n  AAPL volume spikes (view): {spikes}")
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

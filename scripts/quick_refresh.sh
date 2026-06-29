@@ -16,89 +16,144 @@ set -euo pipefail
 export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-DB="${REPO_DIR}/market_data.duckdb"
-LOG_DIR="${REPO_DIR}/logs"
-mkdir -p "$LOG_DIR"
+DEFAULT_REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_DIR="${REPO_DIR:-$DEFAULT_REPO_DIR}"
+DB="${DB:-${REPO_DIR}/market_data.duckdb}"
+export DB
+LOG_DIR="${LOG_DIR:-${REPO_DIR}/logs}"
+PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
+TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
+LOCK_FILE="${LOCK_FILE:-/tmp/market_data_quick_refresh.lock}"
+PULL_HOURLY_TIMEOUT_SECONDS="${PULL_HOURLY_TIMEOUT_SECONDS:-600}"
+BUILD_HIGHER_TIMEOUT_SECONDS="${BUILD_HIGHER_TIMEOUT_SECONDS:-300}"
+CREATE_VIEWS_TIMEOUT_SECONDS="${CREATE_VIEWS_TIMEOUT_SECONDS:-300}"
+REFRESH_INTRADAY_TIMEOUT_SECONDS="${REFRESH_INTRADAY_TIMEOUT_SECONDS:-600}"
+REFRESH_DAILY_TIMEOUT_SECONDS="${REFRESH_DAILY_TIMEOUT_SECONDS:-300}"
+# Market-aware freshness gate.  Sunday night legitimately sees Friday-close
+# hourly/4h data.  Weekdays must be strict; weekends allow closed-market age.
+WEEKDAY_MAX_AGE_HOURS="${WEEKDAY_MAX_AGE_HOURS:-30}"
+WEEKEND_MAX_AGE_HOURS="${WEEKEND_MAX_AGE_HOURS:-80}"
 
+mkdir -p "$LOG_DIR"
 RUN_ID="$(date +%Y%m%dT%H%M%S%z)"
 LOG_FILE="$LOG_DIR/quick_refresh_${RUN_ID}.log"
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+fail() {
+    local rc="$1"
+    shift
+    echo "   ❌ ERROR: $*"
+    echo ""
+    echo "═══════════════════════════════════════"
+    echo "  QUICK REFRESH FAILED"
+    echo "  $(date -Is)"
+    echo "  Exit: $rc"
+    echo "  Log: $LOG_FILE"
+    echo "═══════════════════════════════════════"
+    exit "$rc"
+}
+
+run_step() {
+    local label="$1"
+    local timeout_seconds="$2"
+    local rc
+    shift 2
+
+    echo ""
+    echo "── ${label} ──"
+    if "$TIMEOUT_BIN" --signal=KILL "$timeout_seconds" "$@"; then
+        echo "   ✅ ${label} complete"
+        return 0
+    else
+        rc=$?
+        fail "$rc" "${label} failed; fail-closed instead of continuing with stale/partial warehouse data"
+    fi
+}
+
+verify_freshness() {
+    "$PYTHON_BIN" - "$DB" "$WEEKDAY_MAX_AGE_HOURS" "$WEEKEND_MAX_AGE_HOURS" <<'PY'
+import datetime as dt
+import sys
+from zoneinfo import ZoneInfo
+
+import duckdb
+
+DB_PATH = sys.argv[1]
+WEEKDAY_MAX = float(sys.argv[2])
+WEEKEND_MAX = float(sys.argv[3])
+
+now_utc = dt.datetime.now(dt.timezone.utc)
+now_market = now_utc.astimezone(ZoneInfo("America/New_York"))
+threshold = WEEKEND_MAX if now_market.weekday() in (5, 6) else WEEKDAY_MAX
+checks = [
+    ("hourly", "hourly_bars", ""),
+    ("daily", "daily_bars", ""),
+    ("indicators", "technical_indicators", ""),
+    ("4h indicators", "technical_indicators", "WHERE timeframe='4h' AND close IS NOT NULL"),
+]
+failures = []
+with duckdb.connect(DB_PATH, read_only=True) as db:
+    for label, table, where_clause in checks:
+        row = db.execute(
+            f"SELECT max(to_timestamp(CAST(timestamp/1000 AS BIGINT))) FROM {table} {where_clause}"
+        ).fetchone()
+        latest = row[0] if row else None
+        if latest is None:
+            print(f"  ❌ {label:15s} NO DATA")
+            failures.append(f"{label}: no data")
+            continue
+        if latest.tzinfo is None:
+            latest = latest.replace(tzinfo=dt.timezone.utc)
+        else:
+            latest = latest.astimezone(dt.timezone.utc)
+        age_hours = (now_utc - latest).total_seconds() / 3600
+        ok = age_hours <= threshold
+        status = "✅" if ok else "❌"
+        print(
+            f"  {status} {label:15s} max={latest.strftime('%Y-%m-%d %H:%M')} "
+            f"({age_hours:.1f}h ago; threshold={threshold:.0f}h)"
+        )
+        if not ok:
+            failures.append(f"{label}: {age_hours:.1f}h old > {threshold:.0f}h threshold")
+
+if failures:
+    print("FATAL freshness verification failed:")
+    for failure in failures:
+        print(f"  - {failure}")
+    raise SystemExit(20)
+PY
+}
+
+# Prevent overlapping quick-refresh/manual runs against one DuckDB file and one
+# shared raw/hourly.ndjson staging file.
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    fail 75 "another market-data quick refresh is already running (lock: $LOCK_FILE)"
+fi
+
 echo "═══════════════════════════════════════"
 echo "  WAREHOUSE QUICK REFRESH"
 echo "  Run: $RUN_ID"
 echo "  $(date -Is)"
+echo "  Repo: $REPO_DIR"
+echo "  DB: $DB"
 echo "═══════════════════════════════════════"
 
-# Step 1: Pull latest hourly bars (the ONLY API call)
-echo ""
-echo "── Step 1: Pull latest hourly bars ──"
-if timeout --signal=KILL 600 /usr/bin/python3 "${REPO_DIR}/pull_hourly.py"; then
-    echo "   ✅ Hourly pull complete"
-else
-    rc=$?
-    echo "   ⚠️  Hourly pull failed (exit $rc) — continuing with existing data"
-fi
+run_step "Step 1: Pull latest hourly bars" "$PULL_HOURLY_TIMEOUT_SECONDS" "$PYTHON_BIN" "${REPO_DIR}/pull_hourly.py"
+run_step "Step 2: Build higher timeframes" "$BUILD_HIGHER_TIMEOUT_SECONDS" "$PYTHON_BIN" "${REPO_DIR}/build_higher_timeframes.py"
+run_step "Step 3: Recreate indicator views" "$CREATE_VIEWS_TIMEOUT_SECONDS" "$PYTHON_BIN" "${REPO_DIR}/create_indicator_views.py"
+run_step "Step 4: Refresh latest intraday indicators (1h + 4h)" "$REFRESH_INTRADAY_TIMEOUT_SECONDS" "$PYTHON_BIN" "${REPO_DIR}/refresh_latest_intraday_indicators.py"
+run_step "Step 5: Refresh latest daily indicators" "$REFRESH_DAILY_TIMEOUT_SECONDS" "$PYTHON_BIN" "${REPO_DIR}/refresh_latest_daily_indicators.py"
 
-# Step 2: Build higher timeframes from hourly (ZERO API)
-echo ""
-echo "── Step 2: Build higher timeframes ──"
-if timeout --signal=KILL 300 /usr/bin/python3 "${REPO_DIR}/build_higher_timeframes.py"; then
-    echo "   ✅ Higher timeframes built"
-else
-    rc=$?
-    echo "   ⚠️  Higher timeframes failed (exit $rc)"
-fi
-
-# Step 3: Recreate indicator views
-echo ""
-echo "── Step 3: Recreate indicator views ──"
-if timeout --signal=KILL 120 /usr/bin/python3 "${REPO_DIR}/create_indicator_views.py"; then
-    echo "   ✅ Indicator views created"
-else
-    rc=$?
-    echo "   ⚠️  Indicator views failed (exit $rc)"
-fi
-
-# Step 4: Refresh latest 1h/4h intraday indicators
-echo ""
-echo "── Step 4: Refresh latest intraday indicators (1h + 4h) ──"
-if timeout --signal=KILL 600 /usr/bin/python3 "${REPO_DIR}/refresh_latest_intraday_indicators.py"; then
-    echo "   ✅ Intraday indicators refreshed"
-else
-    rc=$?
-    echo "   ⚠️  Intraday indicators failed (exit $rc)"
-fi
-
-# Step 5: Refresh latest daily indicators
-echo ""
-echo "── Step 5: Refresh latest daily indicators ──"
-if timeout --signal=KILL 300 /usr/bin/python3 "${REPO_DIR}/refresh_latest_daily_indicators.py"; then
-    echo "   ✅ Daily indicators refreshed"
-else
-    rc=$?
-    echo "   ⚠️  Daily indicators failed (exit $rc)"
-fi
-
-# Verify data freshness
 echo ""
 echo "── Verification ──"
-/usr/bin/python3 -c "
-import duckdb, datetime
-db = duckdb.connect('$DB', read_only=True)
-for tbl, label in [('hourly_bars','hourly'), ('daily_bars','daily'), ('technical_indicators','indicators')]:
-    r = db.execute(f\"SELECT max(timestamp)/1000 FROM {tbl}\").fetchone()
-    if r[0]:
-        dt = datetime.datetime.fromtimestamp(r[0], tz=datetime.timezone.utc)
-        age_hr = (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds() / 3600
-        status = '✅' if age_hr < 24 else '⚠️'
-        print(f'  {status} {label:15s} max={dt.strftime(\"%Y-%m-%d %H:%M\")} ({age_hr:.1f}h ago)')
-    else:
-        print(f'  ❌ {label:15s} NO DATA')
-db.close()
-"
+if verify_freshness; then
+    echo "   ✅ Verification complete"
+else
+    rc=$?
+    fail "$rc" "warehouse freshness verification failed"
+fi
 
 echo ""
 echo "═══════════════════════════════════════"
